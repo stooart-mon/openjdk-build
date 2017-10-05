@@ -29,12 +29,16 @@ OPENJDK_UPDATE_VERSION=$5
 OPENJDK_BUILD_NUMBER=$6
 OPENJDK_DIR=$WORKING_DIR/$OPENJDK_REPO_NAME
 
+
 RUN_JTREG_TESTS_ONLY=""
+
 
 if [ "$JVM_VARIANT" == "--run-jtreg-tests-only" ]; then
   RUN_JTREG_TESTS_ONLY="--run-jtreg-tests-only"
   JVM_VARIANT="server"
 fi
+
+echo "${JDK_PATH}"
 
 MAKE_COMMAND_NAME=${MAKE_COMMAND_NAME:-"make"}
 MAKE_ARGS_FOR_ANY_PLATFORM=${MAKE_ARGS_FOR_ANY_PLATFORM:-"images"}
@@ -127,6 +131,11 @@ buildingTheRestOfTheConfigParameters()
   CONFIGURE_ARGS="${CONFIGURE_ARGS} --with-cacerts-file=${WORKING_DIR}/cacerts_area/security/cacerts"
   CONFIGURE_ARGS="${CONFIGURE_ARGS} --with-alsa=${WORKING_DIR}/alsa-lib-${ALSA_LIB_VERSION}"
 
+  # Point-in-time dependency for openj9 only
+  if [[ "${BUILD_VARIANT}" == "openj9" ]] ; then
+    CONFIGURE_ARGS="${CONFIGURE_ARGS} --with-freemarker-jar=${WORKING_DIR}/freemarker-${FREEMARKER_LIB_VERSION}/lib/freemarker.jar"
+  fi
+
   if [[ -z "${FREETYPE}" ]] ; then
     FREETYPE_DIRECTORY=${FREETYPE_DIRECTORY:-"${WORKING_DIR}/${OPENJDK_REPO_NAME}/installedfreetype"}
     CONFIGURE_ARGS="${CONFIGURE_ARGS} --with-freetype=$FREETYPE_DIRECTORY"
@@ -163,18 +172,25 @@ stepIntoTheWorkingDirectory()
 
 runTheOpenJDKConfigureCommandAndUseThePrebuiltConfigParams()
 {
+  echo "Configuring command and using the pre-built config params..."
+
   cd "$OPENJDK_DIR" || exit
-  CONFIGURED_OPENJDK_ALREADY=$(find -name "config.status")
+
+  echo "Currently at '${PWD}'"
+
+  CONFIGURED_OPENJDK_ALREADY=$(find . -name "config.status")
 
   if [[ ! -z "$CONFIGURED_OPENJDK_ALREADY" ]] ; then
     echo "Not reconfiguring due to the presence of config.status in ${WORKING_DIR}"
   else
     CONFIGURE_ARGS="${CONFIGURE_ARGS} ${CONFIGURE_ARGS_FOR_ANY_PLATFORM}"
 
-    echo "Running ./configure with arguments $CONFIGURE_ARGS"
-    # Depends upon the configure command being split for multiple args.  Dont quote it.
+    echo "Running ./configure with arguments '${CONFIGURE_ARGS}'"
+    # Depends upon the configure command being split for multiple args.  Don't quote it.
     # shellcheck disable=SC2086
-    bash ./configure $CONFIGURE_ARGS
+    bash ./configure ${CONFIGURE_ARGS}
+
+    # shellcheck disable=SC2181
     if [ $? -ne 0 ]; then
       echo "${error}"
       echo "Failed to configure the JDK, exiting"
@@ -200,10 +216,12 @@ buildOpenJDK()
     exit 0
   fi
 
-  echo "Building the JDK: calling ${MAKE_COMMAND_NAME} ${MAKE_ARGS_FOR_ANY_PLATFORM}"
-  ${MAKE_COMMAND_NAME} ${MAKE_ARGS_FOR_ANY_PLATFORM}
+  FULL_MAKE_COMMAND="${MAKE_COMMAND_NAME} ${MAKE_ARGS_FOR_ANY_PLATFORM}"
+  echo "Building the JDK: calling '${FULL_MAKE_COMMAND}'"
+  exitCode=$(${FULL_MAKE_COMMAND})
 
-  if [ $? -ne 0 ]; then
+  # shellcheck disable=SC2181
+  if [ "${exitCode}" -ne 0 ]; then
      echo "${error}Failed to make the JDK, exiting"
     exit;
   else
@@ -214,7 +232,8 @@ buildOpenJDK()
 
 printJavaVersionString()
 {
-  PRODUCT_HOME=$(ls -d $OPENJDK_DIR/build/*/images/j2sdk-image)
+  # shellcheck disable=SC2086
+  PRODUCT_HOME=$(ls -d $OPENJDK_DIR/build/*/images/${JDK_PATH})
   if [[ -d "$PRODUCT_HOME" ]]; then
      echo "${good}'$PRODUCT_HOME' found${normal}"
      # shellcheck disable=SC2154
@@ -231,22 +250,52 @@ printJavaVersionString()
 removingUnnecessaryFiles()
 {
   echo "Removing unnecessary files now..."
-  
+
+  echo "Fetching the first tag from the OpenJDK git repo..."
   OPENJDK_REPO_TAG=$(getFirstTagFromOpenJDKGitRepo)
   if [ "$USE_DOCKER" != "true" ] ; then
      rm -rf cacerts_area
   fi
 
+  cd "${WORKING_DIR}/${OPENJDK_REPO_NAME}" || return
+
   cd build/*/images || return
 
-  rm -fr "${OPENJDK_REPO_TAG}" || true
-  mv j2sdk-image "${OPENJDK_REPO_TAG}"
+  echo "Currently at '${PWD}'"
+
+  echo "moving ${JDK_PATH} to ${OPENJDK_REPO_TAG}"
+  rm -rf "${OPENJDK_REPO_TAG}" || true
+  mv "$JDK_PATH" "${OPENJDK_REPO_TAG}"
 
   # Remove files we don't need
-  rm -rf "${OPENJDK_REPO_TAG}"/demo/applets
-  rm -rf "${OPENJDK_REPO_TAG}"/demo/jfc/Font2DTest
-  rm -rf "${OPENJDK_REPO_TAG}"/demo/jfc/SwingApplet
-  find . -name "*.diz" -type f -delete
+  rm -rf "${OPENJDK_REPO_TAG}"/demo/applets || true
+  rm -rf "${OPENJDK_REPO_TAG}"/demo/jfc/Font2DTest || true
+  rm -rf "${OPENJDK_REPO_TAG}"/demo/jfc/SwingApplet || true
+  find . -name "*.diz" -type f -delete || true
+
+  echo "Finished removing unnecessary files from ${OPENJDK_REPO_TAG}"
+}
+
+signRelease()
+{ 
+  if [ "$SIGN" ]; then
+    if [[ "$OSTYPE" == "cygwin" ]]; then
+      echo "Signing release"
+      signToolPath=${signToolPath:-"/cygdrive/c/Program Files/Microsoft SDKs/Windows/v7.1/Bin/signtool.exe"}
+      # Sign .exe files
+      FILES=$(find "${OPENJDK_REPO_TAG}" -type f -name '*.exe')
+      for f in $FILES; do
+        "$signToolPath" sign /f "$CERTIFICATE" /p "$SIGN_PASSWORD" /fd SHA256 /t http://timestamp.verisign.com/scripts/timstamp.dll "$f"
+      done
+      # Sign .dll files
+      FILES=$(find "${OPENJDK_REPO_TAG}" -type f -name '*.dll')
+      for f in $FILES; do
+        "$signToolPath" sign /f "$CERTIFICATE" /p "$SIGN_PASSWORD" /fd SHA256 /t http://timestamp.verisign.com/scripts/timstamp.dll "$f"
+      done
+    else
+      echo "Skiping code signing as it's only supported on Windows"
+    fi
+  fi
 }
 
 createOpenJDKTarArchive()
@@ -297,5 +346,6 @@ runTheOpenJDKConfigureCommandAndUseThePrebuiltConfigParams
 buildOpenJDK
 printJavaVersionString
 removingUnnecessaryFiles
+signRelease
 createOpenJDKTarArchive
 showCompletionMessage
